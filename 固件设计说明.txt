@@ -1,0 +1,873 @@
+
+
+
+
+固件设计说明
+
+
+
+
+目录
+1.	程序主要架构框图	4
+2.	主程序调度	4
+2.1.	主程序列表	4
+3.	与上位机通信交互的数据结构	5
+3.1.	SuperMaster接口	5
+3.1.1.	BASE表数据结构	5
+3.1.2.	LUK表数据结构	7
+3.1.3.	Driver表数据结构	8
+3.1.4.	CFG数据定义	9
+3.2.	协议相关的I2C	11
+4.	存储数据结构	11
+4.1.	Base表结构	11
+4.2.	Rx power base表结构	11
+4.3.	Luk表数据结构	12
+4.4.	Cfg表数据结构	12
+4.4.1.	cfg0表	12
+4.4.2.	cfg1表	13
+4.5.	Driver表数据结构	13
+5.	统一的表号定义	14
+5.1.	base表编号和LUK表编号	14
+5.2.	Driver表编号	17
+5.3.	ADC编号	17
+6.	Base表和Luk的使用方法	19
+6.1.	总述	19
+6.2.	BaseTask定义及使用	19
+6.3.	BaseMap的定义及使用	20
+7.	涉及到基本结构定义	21
+7.1.	用整数实现浮点数定义	21
+7.2.	分段查找表结构定义	21
+7.3.	一元二次参数定义	21
+7.4.	RSSI  ADC温度补偿参数定义	22
+7.5.	错误状态码定义	22
+7.6.	数据类型定义	22
+7.7.	工作模式处理参数定义	23
+8.	计算用函数	23
+8.1.	工作模式处理函数	23
+8.2.	一元二次函数	24
+8.3.	分段查找表函数	25
+9.	文件分类	26
+9.1.	App	26
+9.2.	Committee	26
+9.3.	Common	26
+9.4.	ExtDriver	27
+9.5.	Mcu	27
+10.	Flash分配原则	28
+10.1.	代码区	28
+11.	命名规则	28
+11.1.	文件命令规则	28
+11.2.	变量命名规则	29
+11.3.	Hex命名规则	29
+
+1.	程序主要架构框图
+
+2.	主程序调度
+2.1.	主程序列表
+主程序中，各任务函数采用的常规循环调用的方式，执行时间是每隔40ms执行一次
+while (1)
+    {
+        if (g_ulSysTick >= 400)
+        {
+            g_ulSysTick = 0;
+
+            FeedWatchdog();
+            ADCReadSamples();        
+            CoreTempDeal();
+            Control();
+            Committee();
+            CmdServ();
+        }
+        g_unPageA2H.stA2.uchStatusControl.bDataNotReady = 0;  //10GEPON数据准备好
+        g_unPageB2H.stA2.uchStatusControl.bDataNotReady = 0;  //EPON数据准备好
+    }
+3.	与上位机通信交互的数据结构
+固件与上位机通信，主要有两个渠道，一是SuperMaster；二是与协议相关的I2C
+3.1.	SuperMaster接口
+Supermaster接口是用于对模块的参数等进行读、写的调试接口，只对公司内部调试使用。在接口设计上，是通过一个指针数组定义的。
+通过上位机SuperMaster程序，下发命令到模块进行解析。程序处理定义在CmdServ.c中
+typedef INT16U(*pFun)(INT8U*);
+const pFun g_apFunMcu[32] = {McuGPIOCmdSer,   McuADCCmdSer,    0/*McuDACCmdSer*/,  McuI2CCmdSer,
+                         0/*McuPLACmdSer*/, McuFlashCmdSer,  0/*McuPWMCmdSer*/, 0/*McuSPICmdSer*/,
+                         FWVerCmdSer,     0/*CommitteeCmdSer*/, 0/*McuMonitorCmdSer*/,  0/*McuAdjustCmd*/,
+                         McuTableCmdSer,  0/*McuCmdSer*/,       GitCommit,             0/*DrvCmdSer*/,
+                         FlashCmdSer,      0,               0,                  0,
+                         0,               0,               0,                  0,
+                         0,               0,               0,                  0,
+                         0,               0,               0,                  0                               
+                       };
+每个函数的功能以及接口定义，见“Supermaster数据帧说明”。上面数组中，指针为0的功能， 是新数据架构不支持的功能。
+
+
+对于新的数据架构，其定义的数据内容描述如下：
+3.1.1.	BASE表数据结构
+typedef struct
+{
+unsigned char   uchProNo;               	// 0,SuperMaster通信协议版本号,ReadOnly
+unsigned char   uchMode;                	// 1,工作模式,Write and Read
+unsigned char   uchBaseId;              	// 2,Base的编号，由固件来定义，可以通过此方式获取表的编号,ReadOnly
+    unsigned char   uchLukMaxSeg;            	// 3,分段式查找表最大段数,不可修改，由固件来定义,可以通过此方式获取表的段数,ReadOnly
+    stQuadraticDef  stQuad;                    // 4-15,一元二次参数,ReadOnly
+    signed long     lMin;                   	// 16-19,需要输出的最小值，TX POWER时，用作最小门限值,Write and Read
+    signed long     lMax;                   	// 20-23,需要输出的最大值，TX POWER时，用作最大门限值,Write and Read
+    signed long     lTarVal;                	// 24-27,输出的目标值,ReadOnly
+    stRxPoweAdcCompDef 	stRxpowerDDMIComp;    	// 28-37,收端ADC补偿，用于DDMI监控，RSSI的共用,Write and Read
+    stRxPoweAdcCompDef 	stRxpowerLosComp;      	// 38-47,收端ADC补偿，用于无光监控，只有中兴无光监控用,Write and Read   
+    unsigned short  uwADC;                 	// 48-49,当前运算使用的ADC,ReadOnly
+// 以下两个不包括其它非设置值的bit位，非设置值bit位设置为0
+unsigned short  uwRegDAC;                  	// 50-51,实际写入到DAC，PWM或Driver中的值,和寄存器中bit位置一致,ReadOnly
+unsigned short  uwRealDAC;                  	// 52-53,实际的DAC，PWM或Driver中的值,是寄存器中bit位右对齐的值,ReadOnly
+} stInterfaceDef;
+
+
+
+具体说明如下表
+表格 1
+BASE表数据格式	
+字节序号	名称	　	说明	数据类型 	字节数	所占bit	读写标识	
+0	协议版本	　	　新数据架构的值 1	无符号数	1	0-7	R	
+1	工作模式	T/Q	T(0x54):查找表模式; Q(0x51):一元二次模式	无符号数	1	0-7	R/W	
+2	Base表号	　	对应的base表号	无符号数	1	0-7	R	
+3	LUK最大段数	　	能支持的最大段数	无符号数	1	0-7	R	
+4	一元二次系数	a	放大后的系数 a= a'*2^n	有符号数	2	0-7	R/W	
+5						8-15		
+6			放大倍数的指数n,	无符号数	2	0-7		
+7						8-15		
+8		b	放大后的系数 a= a'*2^n	有符号数	2	0-7		
+9						8-15		
+10			放大倍数的指数n,	无符号数	2	0-7		
+11						8-15		
+12		c	常数项	有符号数	4	0-7		
+13						8-15		
+14						16-23		
+15						24-31		
+16	最小值	　	1.tx power监控时，最小门限（其它DDMI监控不用） 2.DAC控制时，设置的最小值	有符号数	4	0-7	R/W	
+17						8-15		
+18						16-23		
+19						24-31		
+20	最大值	　	1.tx power监控时，最大门限（其它DDMI监控不用） 2.DAC控制时，设置的最大值	有符号数	4	0-7	R/W	
+21						8-15		
+22						16-23		
+23						24-31		
+24	计算结果	　	　配合“返回的DAC值”一起，当计算出现错误时，此值为0	有符号数	4	0-7	R	
+25						8-15		
+26						16-23		
+27						24-31		
+28	rx power监控补偿参数	参考温度	调试时的参考温度ADC	无符号数	2	0-7	R/W	
+29						8-15		
+30		低温系数	放大后的系数 k = k'*2^n	有符号数	2	0-7	R/W	
+31						8-15		
+32			放大倍数的指数n,	无符号数	2	0-7		
+33						8-15		
+34		高温系数	放大后的系数,有符号数 k = k'*2^n	有符号数	2	0-7	R/W	
+35						8-15		
+36			放大倍数的指数n,	无符号数	2	0-7		
+37						8-15		
+38	rx power无光监控补偿参数	参考温度	调试时的参考温度ADC,无符号数	无符号数	2	0-7	R/W	
+39						8-15		
+40		低温系数	放大后的系数, k = k'*2^n	有符号数	2	0-7	R/W	
+41						8-15		
+42			放大倍数的指数n,	无符号数	2	0-7		
+43						8-15		
+44		高温系数	放大后的系数, k = k'*2^n	有符号数	2	0-7	R/W	
+45						8-15		
+46			放大倍数的指数n,	无符号数	2	0-7		
+47						8-15		
+48	计算用到的ADC	　	当前计算或控制量会用到的ADC值	无符号数	2	0-7	R	
+49						8-15		
+50	返回的DAC值	　	控制量计算后，实际写到DAC寄存器或DRIVER寄存器的回读值. 当有错误产生时，此处返回的值为0xFFFF	无符号数	2	0-7	R	
+51						8-15		
+52	返回的实际有效的DAC值		控制量计算后，实际写到DAC寄存器或DRIVER寄存器的回读值，是寄存器中的值右对齐. 当有错误产生时，此处返回的值为0xFFFF	无符号数	2	0-7	R	
+53						8-15		
+相关命令	
+MCU_GET_TABLE(BASE,BASE编号，开始地址，读的长度) 如：读取base0的工作模式 MCU_GET_TABLE(BASE,0,1,1) MCU_SET_TABLE(BASE,BASE编号，开始地址，写入的数据） 如：设置base0的工作模式为Q模式 MCU_SET_TABLE(BASE,0,1,0x51) base表的保存采用自动保存，只要触发了对base表的写操作，程序会自动存入flash中	
+	
+	
+	
+
+所有的监控和控制都用此数据结构来交换数据，包括设置工作模式、补偿用的系数等。
+
+3.1.2.	LUK表数据结构
+如果产品要用到分段式查找表功能时，还会涉及到查找表的数据。每一段的定义如下：
+
+typedef struct
+{    
+signed long     lOffset;           	    // 0-3一元一次方程Y = K * X + B的偏移量
+stIntFloatDef    stSlop;            		// 4-7一元一次方程Y = K * X + B的斜率
+signed short    wIndex;            	// 8-9段与段之间的分界点
+} stSegDef;
+目前分配的段数为：
+RX POWER监控补偿：最大18段
+其它的监控及控制类：6段
+表格 2
+LUK表数据格式	
+字节序号	名称	　说明	备注	数据类型　	字节数	所占bit	读写标识	
+0	第0段	偏移量B		有符号数	4	0-7	R/W	
+1						8-15		
+2						16-23		
+3						24-31		
+4		斜率K	放大后的系数 k = k'*2^n	有符号数	2	0-7		
+5						8-15		
+6			放大倍数的指数n,	无符号数	2	0-7		
+7						8-15		
+8		分界点	　	无符号数	2	0-7		
+9						8-15		
+0	第1段	偏移量B		有符号数	4	0-7	R/W	
+1						8-15		
+2						16-23		
+3						24-31		
+4		斜率K	放大后的系数 k = k'*2^n	有符号数	2	0-7		
+5						8-15		
+6			放大倍数的指数n,	无符号数	2	0-7		
+7						8-15		
+8		分界点	　	无符号数	2	0-7		
+9						8-15		
+……	其它段定义相同	
+相关命令	
+MCU_GET_TABLE(LUK,LUK编号，开始地址，读的长度) 如：读取luk0第0段的分界点 MCU_GET_TABLE(LUK,0,8,2) MCU_SET_TABLE(LUK,LUK编号，开始地址，写入的数据） 如：设置luk0第0段的分界点为0x0010 MCU_SET_TABLE(LUK,0,8,0x10,0x00) luk表的保存采用自动保存，只要触发了对luk表的写操作，程序会自动存入flash中	
+	
+	
+
+3.1.3.	Driver表数据结构
+driver寄存器的定义如下，每一个需要操作的寄存器都对应一个如下的结构
+typedef struct
+{
+    INT8U uchRegAddr;				// 寄存器地址
+    INT8U uchRegVal;				// 寄存器值
+    INT8U uchWriteEnable;			// 寄存器是否可写、可存标识。1：可写、可存
+} stRegCfgDef;
+
+表格 3
+Driver表数据格式	
+字节数	名称	说明	备注	数据类型 	字节数	所占bit	读写标识	
+0	配置寄存器0	寄存器地址	　	无符号数	1	0-7	R	
+1		寄存器值	　	无符号数	1	0-7	R	
+2		寄存器可保存标志	1：表示对应的寄存器可写并可保存	无符号数	1	0-7	R	
+3	配置寄存器1	寄存器地址	　	无符号数	1	0-7	R	
+4		寄存器值	　	无符号数	1	0-7	R	
+5		寄存器可保存标志	1：表示对应的寄存器可写并可保存	无符号数	1	0-7	R	
+……	其它段定义相同	
+相关命令	
+// 通过此命令可以读取DRIVER配置在flash中的值 MCU_GET_TABLE(DRIVER,DRIVER编号，开始地址，读的长度)  // 对Driver的操作采用如下命令对寄存器进行操作 MCU_I2C_READ(设备地址，寄存器地址，数据长度) 如:读取设备地址为0x48的寄存器10的值 MCU_I2C_READ(0x48,10,1) MCU_I2C_WRITE(设备地址，寄存器地址，写入的数据) 如:设置设备地址为0x48的寄存器10的值为0x55 MCU_I2C_WRITE(0x48,10,0x55)  // 采用如下命令将driver中寄存器值保存到flash中，能保存的寄存器为FFR中的开放寄存器 MCU_UPDATE_FLASH(DRIVER,x)	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+
+3.1.4.	CFG数据定义
+CFG表主要用于定义一些开关控制量和一些特殊处理数据
+Cfg0其定义如下表
+表格 4
+CFG0表数据格式	
+字节数	Bit位	说明	备注	数据类型 	字节数	是否可保存	读写标识	
+0	Bit0	保留位	　	无符号数	　 　 　 1　 　 　 　 　	　	　	
+	Bit1		　			　	　	
+	Bit2		　			　	　	
+	Bit3		　			　	　	
+	Bit4		　			　	　	
+	Bit5		　			　	　	
+	Bit6		　			　	　	
+	Bit7		　			　	　	
+1	Bit8	DU测连续不断地发OAM信号控制	　0:正常功能 1:DU测连续不断地发OAM信号进行通信.上电为0	无符号数	　 　 　 1 　 　 　 　	　	　	
+	Bit9	参考电压使用标识	0：内部参考电压；1：外部参考电压　			　	　	
+	Bit10	E2备份使能位	1:使能E2备份功能;0:关闭flash备份功能. 上电默认为1　			　	　	
+	Bit11	driver背光等级	3个bit，APN说明要根据具体的driver手册说明这三个bit组合的定义，bit13:MSB,bit11：LSB　　			　	　	
+	Bit12					　	　	
+	Bit13					　	　	
+	Bit14	8472 B2H下半区	对标准品 默认=0（写保护关，可写）　			　	　	
+	Bit15	8472 B2H上半区	对标准品 默认=0（写保护关，可写）　			　	　	
+2	Bit16	8472 B0H下半区	对标准品 默认=0（写保护关，可写）　	无符号数	　 　 　 1 　 　 　 　	　	　	
+	bit17	8472 B0H上半区	对标准品 默认=0（写保护关，可写）　			　	　	
+	Bit18	8077 A0H TABLE2 8472 A2H下半区	对标准品 默认=0（写保护关，可写）　			　	　	
+	Bit19	8077 A0H TABLE1 8472 A2H上半区	对标准品 默认=0（写保护关，可写）　			　	　	
+	Bit20	8077 A0H TABLE0 8472 A0H下半区	对标准品 默认=0（写保护关，可写）　			　	　	
+	Bit21	8077 A0H上半区 8472 A0H上半区	对标准品 默认=0（写保护关，可写）			是	RW	
+	Bit22	GPON APC开闭环控制	1：开环。默认=0			是	RW	
+	Bit23	XGPON APC开闭环控制	1：开环。默认=1			是	RW	
+3	Bit24	GPON TEC锁定标志	1：锁定	无符号数	　 　 　 1 　 　 　 　	否	R	
+	Bit25	XGPON TEC锁定标志	1：锁定			否	R	
+	Bit26	GPON SD信号标志位	1：有光信号			否	R	
+	Bit27	XGPON SD号标志位	1：有光信号			否	R	
+	Bit28	PID手动控制	1：可以通过手动模式来控制H桥的PWM值，控制的值为一元二次的常数项			是	RW	
+	Bit29	bootloader地址控制	1：DS4830A的bootloader地址（34H）不可见，不可下固件 0：使能DS4830A的bootloader地址，可以下固件			否	RW	
+	Bit30	flash写保护LSB	针对ADuC7020(3)的MCU 设置: 11：表示写保护，01：表示不保护。读取: 10：表示写保护，00：表示不保护			是	RW	
+	Bit31	flash写保护MSB				是	RW	
+相关命令	
+// 通过此命令可以读取CFG的配置值 MCU_GET_TABLE(CFG,0,开始地址，读的长度) 如：读取第3字节的会上 MCU_GET_TABLE(CFG,0,3,1)  // 通过此命令可以写入CFG的配置值 MCU_GET_TABLE(CFG,0,开始地址，写入的数据) 如：关闭bootloader地址，应设置字节3的bit5为1 MCU_GET_TABLE(CFG,0,3,0x20)  // 通过此命令可以将写入CFG的配置值写入到flash中 MCU_UPDATE_FLASH(CFG,0)	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+
+Cfg1定义如下
+表格 5
+CFG1表数据格式	
+字节数	名称	　说明	备注	数据类型 	字节数	所占bit	读写标识	
+0	ADC 门限	ADC LSB	用于XGPON RSSI无光监控门限，中兴固件用	无符号数	2	0~7	RW	
+1		ADC MSB				8~15	RW	
+2	ADC 门限	ADC LSB	用于GPON RSSI无光监控门限，中兴固件用	无符号数	2	0~7	RW	
+3		ADC MSB				8~15	RW	
+相关命令	
+注：以后相对于base表中没有定义的一些客户特殊应用的参数，定义在此表中 // 通过此命令可以读取CFG的配置值 MCU_GET_TABLE(CFG,1,开始地址，读的长度) 如：读取XGPON RSSI无光监控门限 MCU_GET_TABLE(CFG,1,0，2)  // 通过此命令可以写入CFG的配置值 MCU_SET_TABLE(CFG,1,开始地址，写入的数据) 如：设置XGPON RSSI无光监控门限为0x1a00 MCU_SET_TABLE(CFG,1,0,0x00,0x1A)  // 通过此命令可以将写入CFG的配置值写入到flash中 MCU_UPDATE_FLASH(CFG,1)	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+3.2.	协议相关的I2C
+这个是通过MCU的i2c slave功能实现的。满足INF8077i或SFF8472等MSA协议要求。
+处理主要通过中断方式来实现。通信满足标准的I2C通信协议。
+
+
+4.	存储数据结构
+固件处理时，base表、PON的rx power LUK表、CFG表是在上电导入到内存中的。其它的表数据，则是在使用时从flash中读出，用完释放掉。
+4.1.	Base表结构
+除rx power 外的Base表 存到flash中的数据结构如下：
+typedef struct
+{	
+	stQuadratic     	stQuad;          	// 0-11,一元二次参数, Write and Read	
+	signed long     	lMin;            	// 12-15,需要输出的最小值，TX POWER时，用作最小门限值,Write and Read
+	signed long     	lMax;           	// 16-19,需要输出的最大值，TX POWER时，用作最大门限值,Write and Read 
+     unsigend char   	uchBaseNo;		// 20,Base表的编号
+	unsigned char 		uchMode;			// 21,工作模式,Write and Read	
+}stBaseCfgDef;
+
+
+
+4.2.	Rx power base表结构
+由于rx power定义与其它不同，因此单独定义一个结构
+typedef struct
+{
+INT16U   uwTempeRef;          	// 调试收端光功率时的核温+50
+stIntFloatDef   stKcompL;     		// 低于参考温度时用的K
+stIntFloatDef   stKcompH;     		// 高于参考温度时用的K
+} stRxPoweAdcCompDef;
+
+typedef struct
+{	
+	stQuadratic     	stQuad;           		// 0-11,一元二次参数,ReadOnly		
+	signed long     	lMin;                	// 12-15,需要输出的最小值， Write and Read
+	signed long     	lMax;                	// 16-19,需要输出的最大值， Write and Read 	
+	stRxPoweAdcCompDef stRxpowerDDMIComp;	    	// 20-29,收端ADC补偿，用于DDMI监控，RSSI的共用,Write and Read
+	stRxPoweAdcCompDef stRxpowerLosComp;       	// 30-39,收端ADC补偿，用于无光监控，只有中兴无光监控用,Write and Read
+unsigend char   	uchBaseNo;			// 40,Base表的编号
+	unsigned char 		uchMode;				// 41,工作模式,Write and Read	
+}stRxpowerCfgDef;
+
+4.3.	Luk表数据结构
+// 定义分段式查找表一个段的结构
+typedef struct
+{
+    signed long      lOffset;         	// 0-3一元一次方程Y = K * X + B的偏移量
+stIntFloatDef    stSlop;           	// 4-7一元一次方程Y = K * X + B的斜率
+signed short     wIndex;        	// 8-9段与段之间的分界点
+    } stSegDef;
+大小根据分段来定，常规luk设计为6段，rx power设计为18段。
+
+4.4.	Cfg表数据结构
+4.4.1.	cfg0表
+用于定义各开关控制量
+typedef struct
+{
+    INT32U REV				 :8 // 保留位
+INT32U IS_OAM_SENDING				 :1 // BIT8, DU测连续不断地发OAM信号控制, 0:正常功能 1:DU测连续不断地发OAM信号进行通信.上电为0
+INT32U IS_VREF_TYPE					 :1 // BIT9, 0：内部参考电压；1：外部参考电压
+INT32U IS_E2_BACKUP					 : 1 //BIT10, 1:使能E2备份功能;0:关闭flash备份功能.上电默认为1
+
+INT32U IS_IPHOTO_RANGE                 : 3; // BIT13~ BIT11 DRIVER背光电流量程选择 
+
+// 注以下部分,根据协议方式选择对应的定义
+// 8472协议(1:写保护，不可写，不可保存)
+INT32U IS_B2HHI_PROT_FLAG               : 1; // BIT14,用于标准品的B2H下半区写保护控制
+INT32U IS_B2HLOW_PROT_FLAG             : 1; // BIT15,用于标准品的B2H上半区写保护控制
+    
+INT32U IS_B0HHI_PROT_FLAG               : 1; // BIT16,用于标准品的B0H下半区写保护控制
+INT32U IS_B0HLOW_PROT_FLAG             : 1; // BIT17,用于标准品的B0H上半区写保护控制
+INT32U IS_A2HHI_PROT_FLAG               : 1; // BIT18,用于标准品的A2H下半区写保护控制
+INT32U IS_A2HLOW_PROT_FLAG             : 1; // BIT19,用于标准品的A2H上半区写保护控制    
+INT32U IS_A0HHI_PROT_FLAG               : 1; // BIT20,用于标准品的A0H下半区写保护控制
+INT32U IS_A0HLOW_PROT_FLAG             :1; // BIT21,用于标准品的A0H上半区写保护控制
+
+// 8077协议(1:写保护，不可写，不可保存)     
+ INT32U RSVD2                            : 3; // BIT16~ BIT14,保留
+ INT32U IS_A0HTAB3_PROT_FLAG             : 1; // BIT17,用于标准品的A0H TABLE3写保护控制
+INT32U IS_A0HTAB2_PROT_FLAG             : 1; // BIT18,用于标准品的A0H TABLE2写保护控制
+ INT32U IS_A0HTAB1_PROT_FLAG             : 1; // BIT19,用于标准品的A0H TABLE1写保护控制    
+ INT32U IS_A0HTAB0_PROT_FLAG             : 1; // BIT20,用于标准品的A0H TABLE0写保护控制
+INT32U IS_A0HLOW_PROT_FLAG             :1; // BIT21,用于标准品的A0H上半区写保护控制
+
+INT32U IS_GAPC_OPENLOOP                 	: 1; // GAPC开闭环控制 = 1开环
+    INT32U IS_XGAPC_OPENLOOP                	: 1; // XGAPC开闭环控制 = 1开环
+
+    INT32U IS_GTEC_LOCK                     	: 1; // GTEC锁定标志    = 1锁定
+    INT32U IS_XGTEC_LOCK                    	: 1; // XGTEC锁定标志   = 1锁定
+    INT32U IS_GPON_SD                       	: 1; // 该标志与协议标志一致，只反映信号探测的高低电平
+    INT32U IS_XGPON_SD                      	: 1; // 该标志与协议标志一致，只反映信号探测的高低电平
+
+    INT32U IS_HBRIGH_MANNUAL_CONTROL    		: 1; // BIT28,TEC手动或自动设置,1:手动设置，0：自动设置（PID）
+    INT32U IS_DIS_BOOTLOADER_ADDR           	: 1; // 1:disable bootloader slave address 34h; 0:enable
+    INT32U IS_FLSAH_PROTECT_FLAG1              : 1; // BIT30
+INT32U IS_FLSAH_PROTECT_FLAG2              : 1; // BIT31,flash写保护功能，bit31~bit30：
+// 设置时，11表示写保护，01表示不保护  
+                                                 // 读取时，10表示写保护状态，00表示不保护状态  
+} stMouduleCfgDef;
+
+
+
+
+typedef union 
+{
+    stMouduleCfgDef    stModuleCfg;    
+    INT32U             ulModuleCfg;
+    INT8U              uchModuleCfg[4];
+} unMcuCfgDef;
+以上结构主要用于对一些在base表中没有表示出来的一些特殊应用数据定义。
+已定义的位置不在变动，需要增加，可重新定义CFG号，对于模块特殊的应用而不是通用的定义，编号从255以递减的方式编号。
+通用型的定义，从0开始编号，以递加的方式编号。
+4.4.2.	cfg1表
+cfg表1用于特殊处理的配置,注意扩展时要凑够偶数字节   
+typedef struct
+{
+    INT16U             uwXGRssiLosAdcTh;   //XGPON rssi无光监控门限ADC
+    INT16U             uwGRssiLosAdcTh;    //GPON  rssi无光监控门限ADC
+}stSpecCfgDef;  
+#define SPEC_CFG_SIZE  (sizeof(stSpecCfgDef))
+
+typedef union
+{
+    stSpecCfgDef       stSpecCfg;
+    INT8U              auchBuf[SPEC_CFG_SIZE];
+    INT16U             auwBuf[SPEC_CFG_SIZE/2];
+}unSpecCfgDef;
+以上结构主要用于对一些在base表中没有表示出来的一些特殊应用数据定义。已定义的位置不在变动，需要增加，在结构内依次增加。
+
+4.5.	Driver表数据结构
+Driver表的数据，对应外围有I2C数据接口的寄存器地址和值。用于对需要处理寄存器的参数在flash中进行保存，可以做到掉电保存。数据结构如下定义：
+
+// driver寄存器操作基本定义
+typedef struct
+{
+    INT8U uchRegAddr;		// 寄存器地址
+    INT8U uchRegVal;			// 寄存器的值
+    INT8U uchWriteEnable;		// 可写，可保存标志。1-可写可保存。
+} stRegCfgDef;
+
+对于需要操作的寄存器，会在lut.h中定义需要操作的寄存器，上电初始化时从flash中读出并写入到Driver中。
+const INT8U FlashDrvTable0[GN7151_REG_NUM][3] =
+{
+    {1,  0x1D, 1},
+    {2,  0xEC, 0},
+    {8,  0x00, 0},
+    {10, 0x18, 1},
+{11, 0x11, 1},
+……
+}
+5.	统一的表号定义
+5.1.	base表编号和LUK表编号
+所有base表和luk表，统一按如下编号定义，需增加，在此枚举中最后依次增加，不可将原来已定义好的覆盖
+typedef enum
+{
+    enXGRxPowerCal = 0,     // XGPON RxPower计算，base0
+    enGRxPowerCal,          // GPON RxPower计算，base1
+
+    enTempCal,              // 温度计算，base2
+    enVoltageCal,           // 电压计算，base3
+
+    enXGTxBiasCal,          // XGPON TxBias计算，base4
+    enGTxBiasCal,           // GPON TxBias计算，base5
+
+    enXGTxPowerCal,         // XGPON TxPower计算，base6
+    enGTxPowerCal,          // GPON TxPower计算，base7
+
+    enXGVapdCal,            // XGPON Vapd电压计算，base8
+    enGVapdCal,             // GPON Vapd电压计算，base9
+
+    enItecCal,              // XGPON Tec电流计算，base10
+
+    enXGApcSet,             // XGPON APC设置，base11
+    enGApcSet,              // GPON APC设置，base12
+
+    enXGModSet,             // XGPON Mod设置，base13
+    enGModSet,              // GPON Mod设置，base14
+
+    enXGCrossSet,           // XGPON cross设置，base15
+    enGCrossSet,            // GPON cross设置，base16
+
+    enTecSet,               // Tec设置,base17
+    enEASet,                // EA设置，base18
+
+    enXGVapdSet,            // XGPON Vapd设置，base19
+    enGVapdSet,             // GPON Vapd设置，base20
+
+    enXGLosSet,             // XGPON Los设置，base21
+    enGLosSet,              // GPON Los设置，base22
+
+    enLa1Set,               // 一级限放设置，base23
+    enLa2Set,               // 二级限放设置，base24
+
+    enXGLosSpdSet,          // 一级限放los门限设置，base25
+    enGLosSpdSet,           // 二级限放los门限设置，base26
+
+    enXGRssiRefSet,         // XGPON rssi参考电压设置，base27
+    enGRssiRefSet,          // GPON rssi参考电压设置，base28
+    
+    enRxPowerCH0Cal,        // RxPower CH0计算，base29
+    enRxPowerCH1Cal,        // RxPower CH1计算，base30
+    enRxPowerCH2Cal,        // RxPower CH2计算，base31
+    enRxPowerCH3Cal,        // RxPower CH3计算，base32
+    enRxPowerCH4Cal,        // RxPower CH4计算，base33
+    enRxPowerCH5Cal,        // RxPower CH5计算，base34
+    enRxPowerCH6Cal,        // RxPower CH6计算，base35
+    enRxPowerCH7Cal,        // RxPower CH7计算，base36
+    
+    enTxBiasCH0Cal,         // TxBias CH0计算，base37
+    enTxBiasCH1Cal,         // TxBias CH1计算，base38
+    enTxBiasCH2Cal,         // TxBias CH2计算，base39
+    enTxBiasCH3Cal,         // TxBias CH3计算，base40
+    enTxBiasCH4Cal,         // TxBias CH4计算，base41
+    enTxBiasCH5Cal,         // TxBias CH5计算，base42
+    enTxBiasCH6Cal,         // TxBias CH6计算，base43
+    enTxBiasCH7Cal,         // TxBias CH7计算，base44
+    
+    enTxPowerCH0Cal,        // TxPower CH0计算，base45
+    enTxPowerCH1Cal,        // TxPower CH1计算，base46
+    enTxPowerCH2Cal,        // TxPower CH2计算，base47
+    enTxPowerCH3Cal,        // TxPower CH3计算，base48
+    enTxPowerCH4Cal,        // TxPower CH4计算，base49
+    enTxPowerCH5Cal,        // TxPower CH5计算，base50
+    enTxPowerCH6Cal,        // TxPower CH6计算，base51
+    enTxPowerCH7Cal,        // TxPower CH7计算，base52
+    
+    enAPCCH0Set,            // APC CH0设置，base53
+    enAPCCH1Set,            // APC CH1设置，base54
+    enAPCCH2Set,            // APC CH2设置，base55
+    enAPCCH3Set,            // APC CH3设置，base56
+    enAPCCH4Set,            // APC CH4设置，base57
+    enAPCCH5Set,            // APC CH5设置，base58
+    enAPCCH6Set,            // APC CH6设置，base59
+    enAPCCH7Set,            // APC CH7设置，base60
+    
+    enModCH0Set,            // Mod CH0设置，base61
+    enModCH1Set,            // Mod CH1设置，base62
+    enModCH2Set,            // Mod CH2设置，base63
+    enModCH3Set,            // Mod CH3设置，base64
+    enModCH4Set,            // Mod CH4设置，base65
+    enModCH5Set,            // Mod CH5设置，base66
+    enModCH6Set,            // Mod CH6设置，base67
+    enModCH7Set,            // Mod CH7设置，base68
+    
+    enVapdCH0Set,           // Vapd CH0设置，base69
+    enVapdCH1Set,           // Vapd CH1设置，base70
+    enVapdCH2Set,           // Vapd CH2设置，base71
+    enVapdCH3Set,           // Vapd CH3设置，base72
+    enVapdCH4Set,           // Vapd CH4设置，base73
+    enVapdCH5Set,           // Vapd CH5设置，base74
+    enVapdCH6Set,           // Vapd CH6设置，base75
+    enVapdCH7Set,           // Vapd CH7设置，base76
+
+    
+    enEACH0Set,             // EA CH0设置，base77     
+    enEACH1Set,             // EA CH1设置，base78     
+    enEACH2Set,             // EA CH2设置，base79     
+    enEACH3Set,             // EA CH3设置，base80     
+    enEACH4Set,             // EA CH4设置，base81     
+    enEACH5Set,             // EA CH5设置，base82     
+    enEACH6Set,             // EA CH6设置，base83     
+    enEACH7Set,             // EA CH7设置，base84     
+                                                      
+    enCrossCH0Set,          // Cross CH0设置，base85  
+    enCrossCH1Set,          // Cross CH1设置，base86  
+    enCrossCH2Set,          // Cross CH2设置，base87  
+    enCrossCH3Set,          // Cross CH3设置，base88  
+    enCrossCH4Set,          // Cross CH4设置，base89  
+    enCrossCH5Set,          // Cross CH5设置，base90  
+    enCrossCH6Set,          // Cross CH6设置，base91  
+    enCrossCH7Set,          // Cross CH7设置，base92  
+                                                      
+    enBalanceCH0Set,        // Balance CH0设置，base93
+    enBalanceCH1Set,        // Balance CH1设置，base94
+    enBalanceCH2Set,        // Balance CH2设置，base95
+    enBalanceCH3Set,        // Balance CH3设置，base96
+    enBalanceCH4Set,        // Balance CH4设置，base97
+    enBalanceCH5Set,        // Balance CH5设置，base98
+    enBalanceCH6Set,        // Balance CH6设置，base99
+    enBalanceCH7Set,        // Balance CH7设置，base100
+    
+    enTecTempRefSet,        // TEC参考电压，base101
+    
+    enVcc20Set,             // 电压调节，base102
+    
+    enTosa1TempCal,         // XGPON Tosa1温度计算，base103
+    enTosa2TempCal,         // XGPON Tosa2温度计算，base104
+    
+    enQTLowSet,             // 快速比较器低门限设置，base105
+    enQTHighSet,            // 快速比较器高门限设置，base106
+        
+    enISoaSet,              // Soa电流设置，base107 
+    enISoaCal,              // Soa电流校准，base108
+        
+    enIntTecCH0Set,         // 内置TEC CH0设置，base109
+    enIntTecCH1Set,         // 内置TEC CH1设置，base110
+    enIntTecCH2Set,         // 内置TEC CH2设置，base111
+    enIntTecCH3Set,         // 内置TEC CH3设置，base112
+    enIntTecCH4Set,         // 内置TEC CH4设置，base113
+    enIntTecCH5Set,         // 内置TEC CH5设置，base114
+    enIntTecCH6Set,         // 内置TEC CH6设置，base115
+    enIntTecCH7Set,         // 内置TEC CH7设置，base116
+    
+    enExtTecCH0Set,         // 外置TEC CH0设置，base117
+    enExtTecCH1Set,         // 外置TEC CH1设置，base118
+    enExtTecCH2Set,         // 外置TEC CH2设置，base119
+    enExtTecCH3Set,         // 外置TEC CH3设置，base120
+    enExtTecCH4Set,         // 外置TEC CH4设置，base121
+    enExtTecCH5Set,         // 外置TEC CH5设置，base122
+    enExtTecCH6Set,         // 外置TEC CH6设置，base123
+    enExtTecCH7Set,         // 外置TEC CH7设置，base124
+    
+    enTxTecIlimSet,          // 内置TEC限流设置，base125
+enDcBiasSet,            // 直流偏置设置，   base126,
+enOamRxSet,            // OAM RX门限设置  base127,
+}enBaseIdDef;
+5.2.	Driver表编号
+所有Driver表，统一按如下编号定义，需增加，在此枚举中最后依次增加，不可将原来已定义好的覆盖
+typedef enum
+{
+    enDrvXG,        // XGPON Driver0	
+    enDrvG,         // GPON Driver1	
+    enDrvLA1,       // 一级限放 Driver2	
+    enDrvLA2,       // 二级限放 Driver3	
+    	
+    enExpansion,    // 外围扩展芯片 Driver4	
+    	
+    enTxCDR1,        // 发端CDR1 Driver5	
+    enRxCDR1,        // 收端CDR1 Driver6	
+    enTxLDD1,        // 发端LDD1 Driver7	
+    enRxTIA1,        // 收端TIA1 Driver8	
+   	
+    enTxCDR2,        // 发端CDR2 Driver9	
+    enRxCDR2,        // 收端CDR2 Driver10	
+    enTxLDD2,        // 发端LDD2 Driver11	
+enRxTIA2,        // 收端TIA2 Driver12 
+} enDrvIdDef;
+5.3.	ADC编号
+所有的ADC接口，统一按如下编号定义，需增加，在此枚举中最后依次增加，不可将原来已定义好的覆盖
+由于PON类和数通类有较大的区别，ADC采取的时两者分开定义
+#if defined __PON__
+#define ADC_CORE_VOLTAGE            g_unAdcMon.awADC[0]	    
+#define ADC_CORE_TEMPER             g_unAdcMon.awADC[1]	    
+#define ADC_TXBIAS_XG               	g_unAdcMon.awADC[2]	    
+#define ADC_TXBIAS_G                	g_unAdcMon.awADC[3]	    
+#define ADC_TXPOWER_XG              g_unAdcMon.awADC[4]	    
+#define ADC_TXPOWER_G               g_unAdcMon.awADC[5]	    
+#define ADC_VAPD_XG                 	g_unAdcMon.awADC[6]	    
+#define ADC_VAPD_G                  	g_unAdcMon.awADC[7]	    
+#define ADC_RXPOWER_XG              g_unAdcMon.awADC[8]     
+#define ADC_RXPOWER_G               g_unAdcMon.awADC[9]	    
+#define ADC_TEC_TEMPER              g_unAdcMon.awADC[10]	
+#define PID_PWM_INPUT               g_unAdcMon.awADC[11]	
+#define PID_TOSA_SDELTA             	g_unAdcMon.awADC[12]	
+//数通ADC接口	                                            
+#elif defined __DT__
+#define ADC_CORE_VOLTAGE            g_unAdcMon.awADC[0]	    
+#define ADC_CORE_TEMPER             g_unAdcMon.awADC[1]	    
+#define ADC_3V3_VOLTAGE             	g_unAdcMon.awADC[2]	    
+#define ADC_Drv_VOLTAGE             	g_unAdcMon.awADC[3]	    
+#define ADC_TXBIAS_CH0              	g_unAdcMon.awADC[4]	    
+#define ADC_TXBIAS_CH1              	g_unAdcMon.awADC[5]	    
+#define ADC_TXBIAS_CH2              	g_unAdcMon.awADC[6]	    
+#define ADC_TXBIAS_CH3              	g_unAdcMon.awADC[7]	    
+#define ADC_TXBIAS_CH4              	g_unAdcMon.awADC[8]	    
+#define ADC_TXBIAS_CH5              	g_unAdcMon.awADC[9]	    
+#define ADC_TXBIAS_CH6              	g_unAdcMon.awADC[10]	
+#define ADC_TXBIAS_CH7              	g_unAdcMon.awADC[11]	
+#define ADC_TXPOWER_CH0             g_unAdcMon.awADC[12]	
+#define ADC_TXPOWER_CH1             g_unAdcMon.awADC[13]	
+#define ADC_TXPOWER_CH2             g_unAdcMon.awADC[14]	
+#define ADC_TXPOWER_CH3             g_unAdcMon.awADC[15]	
+#define ADC_TXPOWER_CH4             g_unAdcMon.awADC[16]	
+#define ADC_TXPOWER_CH5             g_unAdcMon.awADC[17]	
+#define ADC_TXPOWER_CH6             g_unAdcMon.awADC[18]	
+#define ADC_TXPOWER_CH7             g_unAdcMon.awADC[19]	
+#define ADC_VAPD_CH0                	g_unAdcMon.awADC[20]	
+#define ADC_VAPD_CH1                g_unAdcMon.awADC[21]	
+#define ADC_VAPD_CH2                g_unAdcMon.awADC[22]	
+#define ADC_VAPD_CH3                g_unAdcMon.awADC[23]	
+#define ADC_VAPD_CH4                g_unAdcMon.awADC[24]	
+#define ADC_VAPD_CH5                g_unAdcMon.awADC[25]	
+#define ADC_VAPD_CH6                g_unAdcMon.awADC[26]	
+#define ADC_VAPD_CH7                g_unAdcMon.awADC[27]	
+#define ADC_RXPOWER_CH0             g_unAdcMon.awADC[28]    
+#define ADC_RXPOWER_CH1             g_unAdcMon.awADC[29]    
+#define ADC_RXPOWER_CH2             g_unAdcMon.awADC[30]    
+#define ADC_RXPOWER_CH3             g_unAdcMon.awADC[31]    
+#define ADC_RXPOWER_CH4             g_unAdcMon.awADC[32]    
+#define ADC_RXPOWER_CH5             g_unAdcMon.awADC[33]    
+#define ADC_RXPOWER_CH6             g_unAdcMon.awADC[34]    
+#define ADC_RXPOWER_CH7             g_unAdcMon.awADC[35]    
+#define ADC_TEC_TEMPER               g_unAdcMon.awADC[36]	
+#define PID_PWM_INPUT                g_unAdcMon.awADC[37]	
+#define PID_TOSA_SDELTA                g_unAdcMon.awADC[38]	
+#define ADC_TOSA_ITEC                 g_unAdcMon.awADC[39]
+6.	Base表和Luk的使用方法
+6.1.	总述
+对于base表和Luk表，采用了通用的定义方式，但对于具体的项目，不一定每一个base定义的都会涉及到。因此，在使用时，只需将需要的base提取出来映射到一个结构中就行了。
+
+
+
+
+6.2.	BaseTask定义及使用
+在固件设计中，采用了一个结构，来定义BaseTask表的基本内容
+typedef struct
+{
+    enBaseIdDef     	enBaseId;                   	// 要用到base的编号
+    INT16U          uwBaseFlashAddr;            	// Base表存放的flash地址开始地址
+    INT16U          uwLukFlashAddr;             	// Luk表存放的flash地址开始地址
+    void (*TaskHook)(void);                     	// 对应base任务的处理函数指
+    enFunTypeDef    enFunType;                  	// 对应的函数类型，0--DDMI监控类，1--DAC控制类
+} stBaseTaskDef;
+对于涉及到的base表项，会用一个结构数组来表现。如下
+const stBaseTaskDef g_astActiveBaseTask[BASE_ACTIVE_NUM] =
+{    
+    {enXGRxPowerCal, 	BASE_TABLE0_FLASHADDR,   LUKUP_TABLE0_FLASHADDR,  MonXGRxPower,   enMonIsrType},
+    {enTempCal,     	BASE_TABLE1_FLASHADDR,   LUKUP_TABLE1_FLASHADDR,  MonCaseTemp,    enMonType},
+    {enVoltageCal,  		BASE_TABLE2_FLASHADDR,   LUKUP_TABLE2_FLASHADDR,  MonVoltage,      enMonType},
+    {enXGTxBiasCal, 		BASE_TABLE3_FLASHADDR,   LUKUP_TABLE3_FLASHADDR,  MonXGTxBias,     enMonType},
+    {enXGTxPowerCal, 	BASE_TABLE4_FLASHADDR,   LUKUP_TABLE4_FLASHADDR,  MonXGTxPower,   enMonType},    
+    {enXGRssiRefSet, 	BASE_TABLE7_FLASHADDR,   LUKUP_TABLE7_FLASHADDR,  AdjXGRssiRef,     enAdjType},
+    {enXGVapdSet,   	BASE_TABLE8_FLASHADDR,   LUKUP_TABLE8_FLASHADDR,  AdjXGVapd,       enAdjType},
+    {enXGLosSpdSet, 	BASE_TABLE9_FLASHADDR,   LUKUP_TABLE9_FLASHADDR,  AdjXGLosSpd,     enAdjType},
+    {enLa1Set,      		BASE_TABLE10_FLASHADDR,  LUKUP_TABLE10_FLASHADDR,  AdjLa1,         enAdjType},
+    {enLa2Set,      		BASE_TABLE11_FLASHADDR,  LUKUP_TABLE11_FLASHADDR,  AdjLa2,         enAdjType},
+    {enEASet,       	BASE_TABLE12_FLASHADDR,  LUKUP_TABLE12_FLASHADDR,  AdjEA,          enAdjType},
+    {enTecSet,      		BASE_TABLE13_FLASHADDR,  LUKUP_TABLE13_FLASHADDR,  AdjTec,          enAdjType},
+    {enXGApcSet,    	BASE_TABLE14_FLASHADDR,  LUKUP_TABLE14_FLASHADDR,  AdjXGApc,       enAdjType},
+    {enXGModSet,    	BASE_TABLE15_FLASHADDR,  LUKUP_TABLE15_FLASHADDR,  AdjXGMod,      enAdjType},
+};
+通过此结构数组，来包含会涉及到的base项，参数存放的flash地址，对应的处理函数，处理函数类型。
+
+
+6.3.	BaseMap的定义及使用
+然后通过一个base map表，将BaseTask表的信息，luk表的信息等集中到一起。在后续的操作中，就可以通过base map表处理相关的参数读、写。
+Base map表的定义如下：
+typedef struct
+{
+    void*            pstBaseCfg;                	// BaseCfg或RxpowerCfg的指针
+stSegDef*        pstLuk;                    	// Luk表的内存地址
+INT16U          uwBaseFlashAddr;            	// Base表存放的flash地址开始地址
+    INT16U          uwLukFlashAddr;             	// Luk表存放的flash地址开始地址
+    INT16U          uwLukMaxSeg;               	// luk表支持的最大段数
+    INT16U          uwADC;                     	// 存放对应项目的ADC值
+    INT16S          wTarVal;                    	// 存放对应项目的计算结果
+INT16U          uwDAC;                    	// 存放对应项目的实际DAC值
+// 以下两个不包括其它非设置值的bit位，非设置值bit位设置为0
+INT16U          uwRegDAC;                  //实际写入到DAC，PWM或Driver中的值,和寄存器中bit位置一致
+INT16U			uwRealDAC;                  //实际的DAC，PWM或Driver中的值,是寄存器中bit位右对齐的值
+} stBaseMapDef;
+在固件初始化时，将需要用到的各项信息映射过来。处理函数如下：
+void InitAcitveBaseMap(void)
+{
+    INT8U   uchIndex;
+    INT8U   uchBaseCfgIndex = 0;
+
+    for (uchIndex = 0; uchIndex < BASE_ACTIVE_NUM; uchIndex++)
+    {
+        //赋值Base表和Luk表对应的Flash地址
+        g_astActiveBaseMap[uchIndex].uwBaseFlashAddr = g_astActiveBaseTask[uchIndex].uwBaseFlashAddr;
+        g_astActiveBaseMap[uchIndex].uwLukFlashAddr = g_astActiveBaseTask[uchIndex].uwLukFlashAddr;
+
+        // 初始化一元二次参数的指针
+        // 由于rx power用的base配置单独定义，在此特殊处理
+        if (enXGRxPowerCal == g_astActiveBaseTask[uchIndex].enBaseId)
+        {
+            // 将ActiveBaseTask对应的base id号，给到项内存的base id
+            g_stXGRssiCalCfg.uchBaseId = (INT8U)g_astActiveBaseTask[uchIndex].enBaseId;
+
+            g_astActiveBaseMap[uchIndex].pstBaseCfg = (void*)&g_stXGRssiCalCfg;
+            g_astActiveBaseMap[uchIndex].pstLuk = g_astXGRssiCalLuk;
+            g_astActiveBaseMap[uchIndex].uwLukMaxSeg = LUK_MAX_SEG * 3;
+        }
+        else if (enGRxPowerCal == g_astActiveBaseTask[uchIndex].enBaseId)
+        {
+            // GPON此项目没有
+        }
+        else
+        {
+            // 将ActiveBaseTask对应的base id号，给到内存的base id
+            g_astBaseCfg[uchBaseCfgIndex].uchBaseId = (INT8U)g_astActiveBaseTask[uchIndex].enBaseId;
+
+            g_astActiveBaseMap[uchIndex].pstBaseCfg = (void*)&g_astBaseCfg[uchBaseCfgIndex];
+            g_astActiveBaseMap[uchIndex].pstLuk = g_astLuk;
+            g_astActiveBaseMap[uchIndex].uwLukMaxSeg = LUK_MAX_SEG;
+
+            // BaseCfg的数量为最大的activer base数量，减去xgpon rx power的项，如果还有GPON rx power的项，此处应减2
+            if (uchBaseCfgIndex < (BASE_ACTIVE_NUM - 1))
+            {
+                uchBaseCfgIndex++;
+            }
+        }
+    }
+}
+7.	涉及到基本结构定义
+7.1.	用整数实现浮点数定义
+由于光模块所用MCU资源有限，在实际运算中，如果直接采用浮点数运算，既耗时间又占flash，ram资源。因此，利用整数来达到浮点数的运算效果，采用如下定义。
+/*******************************************************************************
+INT16S  integer;      	// 乘上2^n后的数据（这个值应在-32768~+32767之间） 
+INT16S  uwExp;        	// 2^n的指数部分n的值（这个值应<=31)
+例如：-0.123456 放大2^17后=-16182
+转换后 integer = -16182（这个值应在-32768~+32767之间）
+       uwExp = 17（这个值应<=31)
+*******************************************************************************/
+typedef struct _ST_FLOAT_
+{    
+    signed short    wInteger;             // 整数部分（放大后的系数，等于实际值*2^n） 
+    unsigned short  uwExp;                // n次 
+}stIntFloatDef;
+
+7.2.	分段查找表结构定义
+// 定义分段式查找表一个段的结构
+typedef struct
+{
+    	signed long      lOffset;         	// 0-3一元一次方程Y = K * X + B的偏移量
+stIntFloatDef    stSlop;           	// 4-7一元一次方程Y = K * X + B的斜率
+signed short     wIndex;        	// 8-9段与段之间的分界点
+}stSegDef;
+
+7.3.	一元二次参数定义
+// 一元二次参数的定义
+typedef struct
+{
+    stIntFloatDef     stFactorA;
+    stIntFloatDef     stFactorB;
+    signed long       lFactorC;
+}stQuadraticDef;
+
+7.4.	RSSI  ADC温度补偿参数定义
+// 根据温度差值来补偿RSSI ADC的系数
+typedef struct
+{
+    unsigned short    uwTemperatureRef;    	// 调试收端光功率时的核温+50
+    IntFloatStrDef    stKcompL;   			// 低于参考温度时用的K  
+    IntFloatStrDef    stKcompH;   			// 高于参考温度时用的K 
+}stRxPoweAdcCompDef;
+
+7.5.	错误状态码定义
+// 定义用于返回计算过程中的错误状态，需要增加的，都在此枚举中增加
+typedef enum
+{
+    enErrSta_None = 0,                    // 运算结果及参数等无错误
+    enErrSta_ParaType,                    // 参数类型错误
+    enErrSta_DataInvalid,                 	// 传入的数据无效
+  
