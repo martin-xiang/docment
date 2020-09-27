@@ -870,4 +870,253 @@ typedef enum
     enErrSta_None = 0,                    // 运算结果及参数等无错误
     enErrSta_ParaType,                    // 参数类型错误
     enErrSta_DataInvalid,                 	// 传入的数据无效
-  
+    enErrSta_DataPtrNull,                 	// 传入的数据指针为空
+    enErrSta_ThreErr,                     	// 阈值数据错
+    enErrSta_LenErr,                    	// 数据长度错误
+    enErrSta_ResInvalid,                  	// 输出的计算结果无效
+    enErrSta_FlashAddrErr,                	// flash操作地址出错
+    enErrSta_AdcChErr,                    // ADC采样的通道错误
+    enErrSta_I2CMWRErr,                	// I2C master读，写错误
+    enErrSta_TecUnlock,                   // Tec失锁
+    enErrSta_FlashWriteFail               	// Flash写失败      
+} enErrStaDef;
+
+1.1.	数据类型定义
+用于对传入的参数类型说明，其它处理函数可以根据数据类型，来做对应的处理。
+typedef enum
+{
+    DataType_Temp = 0,                  // 温度类型
+    
+    DataType_INT8S,                     // 8bit有符号型数据
+    DataType_INT8U,                     // 8bit无符号型数据
+    
+    DataType_INT16S,                    // 16bit有符号型数据
+    DataType_INT16U,                    // 16bit无符号型数据 
+}DataTypeDef;
+1.2.	工作模式处理参数定义
+用于DDMI计算或DAC控制函数的传递参数表。计算函数根据这些参数就可以计算出需要的值。
+typedef struct
+{
+    signed long     	lMin;                // 需要输出的最小值
+    signed long     	lMax;                // 需要输出的最大值  
+signed long       lTarVal;			    // 根据参数计算出来的结果
+stSegCalDef     	*pstSegCal;          	// 分段式查找表参数指针
+stQuadraticDef   	*pstQuad;            // 一元二次参数指针  
+    signed short    	wAdc;               // 传入的用于计算的ADC值
+    unsigned char   	uchMod;             // 工作模式
+    unsigned char   	uchPointSize;        	// 分段式查找表用到的最大段数
+DataTypeDef    	uchDataType;         // 传入的数据类弄，指向DataTypeDef定义的数据类型
+} stParaCalDef;
+2.	计算用函数
+2.1.	工作模式处理函数
+此函数用于判断采用的工作模式和调用相对应的计算函数进行计算。
+工作模式只支持两种模式：T(分段查找表模式)，Q	(一元二次拟合模式)
+/****************************************************************************************
+ Function Name   : WorkModeDeal
+ Description     : 用于处理不同工作模式条件下，采用不同方法计算
+ Input Argument  : *pstPara--传入的用于计算的各参数指针，参数列表定义见stParaCal。
+ Output          : none
+ Return          : 错误状态标志,返回值enErrStaDef定义
+****************************************************************************************/
+enErrStaDef WorkModeDeal(stParaCalDef* pstPara)
+{
+    enErrStaDef  enErrSta = enErrSta_None;
+
+    // 判断传入的指针是否有效
+    if (NULL == pstPara)
+    {
+        return enErrSta_DataPtrNull;
+    }
+
+    // 判断最大最小值设置是否正确
+    if (pstPara->lMin > pstPara->lMax)
+    {
+        return enErrSta_ThreErr;
+    }
+
+    switch (pstPara->uchMod)
+    {
+        // 一元二次的曲线拟合模式
+        case  WORK_MOD_QUADRATIC:
+            enErrSta = TypeCurveCalQuadratic((enDataTypeDef)(pstPara->uwDataType),
+                                             (void*)(&(pstPara->uwAdc)),
+                                             pstPara->pstQuad,
+                                             pstPara->lMin,
+                                             pstPara->lMax,
+                                             &pstPara->lTarVal);
+
+
+
+            break;
+        // 分段查找表模式
+        case  WORK_MOD_TABLE:
+            enErrSta = SegCalculate((enDataTypeDef)(pstPara->uwDataType),
+                                    (void*)(&(pstPara->uwAdc)),
+                                    pstPara->pstLuk,
+                                    pstPara->uwLukMaxSeg,
+                                    pstPara->lMin,
+                                    pstPara->lMax,
+                                    &pstPara->lTarVal);
+            break;
+
+        default:
+            enErrSta = enErrSta_ResInvalid;
+            break;
+    }
+
+    return enErrSta;
+}
+2.2.	一元二次函数
+/****************************************************************************************
+ Function Name   : TypeCurveCalQuadratic
+ Description     : 通过曲线拟合的方式计算一元二次方程，根据ADC/DAC类型会做处理
+ Input Argument  : DataType--ADC/DAC类型，
+                              0：（核温+50度）*256的温度值,以1/256为单位计算
+                              1：8bit有符号型数据
+                              2：8bit无符号型数据
+                              3：16bit有符号型数据
+                              4：16bit无符号型数据
+                   Dat:输入的ADC/DAC值的指针；
+                   pPara:一元二次方程传入的a,b,c参数的结构指针。
+                   a,b用一个4字节表示。高16位表示经过2^n放大后的值，范围是-32768~32767.
+                                       低16位表示放大倍数2^n的n值,范围是0~31
+                   Min:最小输出值，计算后的值应与这个值比较，小于这个值则返回这个最小值
+                   Max:最大输出值，计算后的值应与这个值比较，大于这个值则返回这个最大值
+                   *CalRes：计算结果的指针
+ Output          :
+ Return          : 错误状态                 
+
+ 二次项计算
+ 将1/256度转换成1/16度，防止在计算时，a*x*x这步溢出.也能保持精度
+应用中，温度ADC的最大值为170*16 = 2720.这样对应的a的最大值为2^31/2720/2720 = 290
+
+非温度的计算中，x的变化量最大为8191（ADC)，a的最大值2^31/8192/8192 = 32
+4095（DAC).a的最大值2^31/4095/4095 = 128
+****************************************************************************************/
+#pragma inline = forced
+enErrStaDef TypeCurveCalQuadratic(enDataTypeDef enDataType,
+                                  void* Dat,
+                                  stQuadraticDef* pstPara,
+                                  signed long lMin,
+                                  signed long lMax,
+                                  signed long* pCalRes)
+
+2.3.	分段查找表函数
+/****************************************************************************************
+ Function Name   : SegCalculate
+ Description     : 通过分段式拟合方式，计算当前索引值条件下，计算出补偿值
+ Input Argument  : DataType--ADC/DAC类型，
+                              0：温度索引值。将计算温度的由1/256℃变为1℃，用来与分界点比较，
+                                 计算仍以 1/256℃，但计算完成后，应除去256
+                              1：8bit有符号型数据
+                              2：8bit无符号型数据
+                              3：16bit有符号型数据
+                              4：16bit无符号型数据
+                   Dat:输入的ADC/DAC值的指针；
+                   pPara:一元一次方程传入的分界点以及K,B参数的首地址指针
+                   K用一个4字节表示。高16位表示经过2^n放大后的值，范围是-32768~32767.
+                                     低16位表示放大倍数2^n的n值,范围是0~31
+                   PointSize：分段查找段表的最大段数
+                   Min:最小输出值，计算后的值应与这个值比较，小于这个值则返回这个最小值
+                   Max:最大输出值，计算后的值应与这个值比较，大于这个值则返回这个最大值
+ Output          :
+ Return          : 错误状态标志,返回值ErrSta_Def定义
+****************************************************************************************/
+#pragma inline = forced
+enErrStaDef SegCalculate(enDataTypeDef enDataType,
+                         void* Dat,
+                         stSegDef* pstPara,
+                         unsigned char uchPointSize,
+                         signed long lMin,
+                         signed long lMax,
+                         signed long* pCalRes)
+
+
+
+
+
+
+
+3.	文件分类
+所有的c文件、h文件、汇编文件等，都按性质，功能分类到不同的文件夹中。分类示意图如下
+
+
+3.1.	App
+包含应用层的c文件，包含文件如下图所示。
+
+
+3.2.	Committee
+包含与协议处理相关的文件，如对SFF8472,INF8077等MSA协议相关
+
+3.3.	Common
+包含一些通用的文件处理，基本所有的模块工程都会存在这些文件。
+
+3.4.	ExtDriver
+包含除MCU外的硬件驱动及相关处理，按外围器件的名称分类
+
+3.5.	Mcu
+包含MCU驱动及相关处理的文件，每一个功能模块一个C文件
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+4.	Flash分配原则
+Flash主要分为两大块，一是代码区；二是数据区。
+4.1.	代码区
+用于存放固件代码的区域，从地址0开始计算。对于DS4830A这样有64K bytes大小的MCU。程序区域可以分配为：0x0000~0xBFFF.
+
+
+
+
+
+4.2.	数据区
+数据从flash的最大地址开始，以递减的方式应用。分配地址及大小定义如下。
+
+协议配置	存放协议数据	数据区：2k字节	
+公共配置项	存放固件公共配置项数据	数据区：512字节	
+DDMI监控类 DAC控制类	查找表模式（T） 通过ADC查找对应的k、b，通过y = k*ADC + b	数据区：3k字节,存放Base表数据 数据区：3k字节，存放Luk表数据	
+	一元二次曲线拟合模式（Q） 通过y = a*ADC*ADC + b*ADC + c的方式计算相对应结果		
+Driver寄存器	DRIVER寄存器读写	数据区：1k字节，存放driver表数据	
+对每一个大类，地址是从大往小用。对大类内部的使用，是从小往大用。
+比如 协议配置区 的A0H，大小为256字节，占的flash大小为512字节。因此A0H起始地址为：0xFE00.
+协议配置区 的A2H，大小为256字节，占的flash大小为512字节。因此A2H起始地址为：0xFC00.
+5.	命名规则
+5.1.	文件命令规则
+ 在取.c，.s等文件名时，
+C如果是单个词语可以表示的，全小写。
+如：watchdog.c，arithmetic.c
+C如果是两个及以上词语表示的，每个词语的首字母大写。
+如：CmdServ.c，
+CDriver的名字全大写。
+如：GN7151.c
+5.2.	变量命名规则
+变量名请按我们前面定义的规则来做。
+5.3.	Hex命名规则
+PON类产品生成的hex文件名，在工程中的表示方法如下：
+SOGX6292-XSG C-AL.hex
+      |          |  |
+      |         |  |
+      |         |   ---- 根据客户定义名称，标准品的不要此项。
+      |         ---------非COMBO的，用A表示;COMBO的用C表示
+      |               也即此类产品有多个定义，如有A,B来表示不同档位的，
+      |               用最低档来表示。
+      ----- ------ -----------根据产品定义命名，可参见FFR
+数通类产品依据FFR名称命名
